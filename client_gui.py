@@ -1,10 +1,9 @@
-# client_gui.py
 import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib
 import socket, threading, json, os, time
 
-SERVER_HOST = '127.0.0.1'
+SERVER_HOST = '127.0.0.1'  # 서버 IP (같은 컴퓨터면 127.0.0.1)
 SERVER_PORT = 9009
 RECV_BUFFER = 65536
 
@@ -12,6 +11,7 @@ class ChatClient:
     def __init__(self):
         self.sock = None
         self.running = False
+        self.name = None         # [수정] 내 이름을 저장할 변수 추가
         self.on_message = None
         self.on_users = None
         self._lock = threading.Lock()
@@ -21,6 +21,8 @@ class ChatClient:
         """
         Blocking connect/register: MUST be called from a background thread.
         """
+        self.name = name          # [수정] 접속 시도하는 이름 저장
+        
         s = socket.create_connection((SERVER_HOST, SERVER_PORT), timeout=timeout)
         # turn off any timeouts for steady recv
         s.settimeout(None)
@@ -139,8 +141,14 @@ class ChatClient:
                 if mtype == "msg":
                     frm = msg.get("from", "unknown")
                     text = msg.get("text", "")
+                    
+                    # [수정] 서버가 반사해준 내 메시지는 무시 (화면에 두 번 뜨는 것 방지)
+                    if frm == self.name:
+                        continue
+                    
                     if self.on_message:
                         GLib.idle_add(self.on_message, f"[{frm}] {text}")
+                        
                 elif mtype == "users":
                     users = msg.get("users", [])
                     if self.on_users:
@@ -217,7 +225,7 @@ class ChatWindow(Gtk.Window):
         sc.add(self.textview)
         hmain.pack_start(sc, True, True, 0)
 
-        # user list (TreeView) - use model= to avoid deprecation warning
+        # user list (TreeView)
         self.user_list_store = Gtk.ListStore(str)
         self.user_tree = Gtk.TreeView(model=self.user_list_store)
         renderer = Gtk.CellRendererText()

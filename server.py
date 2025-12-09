@@ -1,5 +1,4 @@
-# server.py
-# Python3 asyncio-based chat+file relay server
+# server.py (Fixed Deadlock Version)
 import asyncio
 import json
 from typing import Dict, Tuple
@@ -12,9 +11,9 @@ clients: Dict[str, Tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
 lock = asyncio.Lock()
 
 async def send_json(writer: asyncio.StreamWriter, obj):
-    data = (json.dumps(obj) + "\n").encode()
-    writer.write(data)
     try:
+        data = (json.dumps(obj) + "\n").encode()
+        writer.write(data)
         await writer.drain()
     except Exception:
         pass
@@ -23,7 +22,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     addr = writer.get_extra_info('peername')
     name = None
     try:
-        # Require registration as first step (one JSON line)
+        # Require registration as first step
         line = await reader.readline()
         if not line:
             writer.close(); await writer.wait_closed(); return
@@ -34,22 +33,25 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             writer.close(); await writer.wait_closed(); return
 
         if msg.get("type") != "register" or not msg.get("name"):
-            await send_json(writer, {"type":"error","msg":"register first with {'type':'register','name':'yourname'}"})
+            await send_json(writer, {"type":"error","msg":"register first"})
             writer.close(); await writer.wait_closed(); return
 
         name = msg["name"]
+
+        # ▼▼▼ [중요 수정] Lock 범위를 최소화하여 교착 상태 방지 ▼▼▼
         async with lock:
             if name in clients:
                 await send_json(writer, {"type":"error","msg":"name already taken"})
                 writer.close(); await writer.wait_closed(); return
             clients[name] = (reader, writer)
             print(f"{name} registered from {addr}")
-            # notify all
-            await broadcast_users()
+        # ▲▲▲ Lock이 여기서 풀립니다 ▲▲▲
 
+        # Lock이 풀린 상태에서 방송(Broadcast)을 해야 안전함
+        await broadcast_users()
         await send_json(writer, {"type":"ok","msg":"registered"})
 
-        # main loop: read header lines (JSON per line)
+        # main loop
         while True:
             header_line = await reader.readline()
             if not header_line:
@@ -57,87 +59,90 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             try:
                 header = json.loads(header_line.decode())
             except Exception:
-                await send_json(writer, {"type":"error","msg":"invalid json header"})
                 continue
 
             htype = header.get("type")
             if htype == "msg":
-                to = header.get("to")  # None for broadcast
+                to = header.get("to")
                 text = header.get("text","")
                 if to:
                     # direct message
+                    target_writer = None
                     async with lock:
                         if to in clients:
-                            _, w = clients[to]
-                            await send_json(w, {"type":"msg","from":name,"text":text})
-                        else:
-                            await send_json(writer, {"type":"error","msg":"user not online"})
+                            _, target_writer = clients[to]
+                    
+                    if target_writer:
+                        await send_json(target_writer, {"type":"msg","from":name,"text":text})
+                    else:
+                        await send_json(writer, {"type":"error","msg":"user not online"})
                 else:
                     # broadcast
                     await broadcast({"type":"msg","from":name,"text":text})
+
             elif htype == "file":
                 to = header.get("to")
                 filename = header.get("filename")
                 size = int(header.get("size",0))
-                if not to or to not in clients:
+
+                target_writer = None
+                async with lock:
+                    if to in clients:
+                        _, target_writer = clients[to]
+                
+                if not target_writer:
                     await send_json(writer, {"type":"error","msg":"recipient not found"})
-                    # consume and discard body safely
+                    # consume body to avoid sync issues
                     try:
                         await reader.readexactly(size)
-                    except Exception:
-                        pass
+                    except: pass
                     continue
-                # forward header to recipient
-                _, w = clients[to]
-                await send_json(w, {"type":"file","from":name,"filename":filename,"size":size})
+                
+                # forward header
+                await send_json(target_writer, {"type":"file","from":name,"filename":filename,"size":size})
+                
                 # relay binary data
                 remaining = size
                 try:
                     while remaining > 0:
                         chunk = await reader.read(min(65536, remaining))
-                        if not chunk:
-                            break
-                        w.write(chunk)
-                        try:
-                            await w.drain()
-                        except Exception:
-                            pass
+                        if not chunk: break
+                        target_writer.write(chunk)
+                        await target_writer.drain()
                         remaining -= len(chunk)
-                except Exception:
-                    pass
+                except: pass
                 print(f"relayed file {filename} from {name} to {to}")
+
             elif htype == "list":
                 await send_user_list(writer)
-            else:
-                await send_json(writer, {"type":"error","msg":"unknown type"})
+
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print("client error:", e)
+        print(f"client error ({name}):", e)
     finally:
         if name:
             async with lock:
                 if name in clients:
                     del clients[name]
                     print(f"{name} disconnected")
-                    await broadcast_users()
+            # Lock 풀고 방송
+            await broadcast_users()
+        
         try:
             writer.close()
             await writer.wait_closed()
-        except:
-            pass
+        except: pass
 
 async def broadcast(obj):
+    # 안전하게 보낼 목록을 먼저 복사
     async with lock:
-        to_remove = []
-        for n,(r,w) in clients.items():
-            try:
-                await send_json(w, obj)
-            except Exception:
-                to_remove.append(n)
-        for n in to_remove:
-            if n in clients:
-                del clients[n]
+        active_writers = [w for (r, w) in clients.values()]
+    
+    for w in active_writers:
+        try:
+            await send_json(w, obj)
+        except: pass
 
 async def send_user_list(writer):
     async with lock:
